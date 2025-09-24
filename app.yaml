@@ -1,0 +1,17 @@
+# app.yaml
+command:
+  - uvicorn
+  - app:app
+  - --host
+  - 0.0.0.0
+  - --port
+  - "8000"
+
+env:
+  - name: DATABRICKS_HOST
+    value: "https://dbc-1660adec-3499.cloud.databricks.com"
+  - name: DATABRICKS_TOKEN
+    # Prefer storing token as a Databricks secret and referencing it here
+    valueFrom: "mcp-scope:dbx-bridge-token"   # name of your secret
+  - name: ALLOWED_ORIGINS
+    value: "https://chat.openai.com"

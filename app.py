@@ -1,10 +1,14 @@
 import os
 import json
+import secrets
+import hashlib
+import base64
+from datetime import datetime, timedelta
 from typing import Optional, Dict, Any, List
 
 import httpx
-from fastapi import FastAPI, Request, HTTPException
-from fastapi.responses import JSONResponse, PlainTextResponse
+from fastapi import FastAPI, Request, HTTPException, Form, Query
+from fastapi.responses import JSONResponse, PlainTextResponse, RedirectResponse, HTMLResponse
 from fastapi.middleware.cors import CORSMiddleware
 
 from mcp.server.fastmcp import FastMCP
@@ -13,6 +17,12 @@ from mcp.server.fastmcp import FastMCP
 DATABRICKS_HOST = os.getenv("DATABRICKS_HOST", "").rstrip("/")
 DATABRICKS_TOKEN = os.getenv("DATABRICKS_TOKEN", "")
 ALLOWED_ORIGINS = os.getenv("ALLOWED_ORIGINS", "https://chat.openai.com").split(",")
+SERVER_BASE_URL = os.getenv("SERVER_BASE_URL", "https://your-databricks-app-url.databricksapps.com")
+
+# OAuth state storage (in production, use Redis or database)
+oauth_states = {}
+auth_codes = {}
+access_tokens = {}
 
 if not DATABRICKS_HOST or not DATABRICKS_TOKEN:
     # Intentionally no raise here: we'll surface a helpful error via a tool.
@@ -136,22 +146,165 @@ mcp_app = mcp.streamable_http_app()
 # Wrap in a FastAPI app for lifecycle and health endpoints
 app = FastAPI()
 
-# Origin check (not CORS): MCP uses 'Origin' but not a browser.
-# We validate origin explicitly to avoid DNS-rebinding and lock to ChatGPT.
+# Enhanced authentication middleware
 @app.middleware("http")
-async def origin_guard(request: Request, call_next):
+async def auth_middleware(request: Request, call_next):
+    # Allow OAuth endpoints without origin check
+    if request.url.path in ["/oauth/authorize", "/oauth/token", "/.well-known/oauth-authorization-server", "/healthz"]:
+        return await call_next(request)
+
+    # Origin check for MCP endpoints
     origin = request.headers.get("origin")
     if origin and ALLOWED_ORIGINS and origin not in ALLOWED_ORIGINS:
         return PlainTextResponse("Forbidden origin", status_code=403)
+
+    # Check for OAuth token on MCP endpoints
+    if request.url.path.startswith("/mcp"):
+        auth_header = request.headers.get("authorization")
+        if auth_header and auth_header.startswith("Bearer "):
+            token = auth_header.split(" ")[1]
+
+            # Check if it's an OAuth access token
+            if token in access_tokens:
+                token_data = access_tokens[token]
+                if datetime.utcnow() > token_data["expires_at"]:
+                    return PlainTextResponse("Token expired", status_code=401)
+                # Token is valid, continue with request
+            # If it's the old Databricks token, allow it (backward compatibility)
+            elif token != DATABRICKS_TOKEN and DATABRICKS_TOKEN:
+                return PlainTextResponse("Invalid token", status_code=401)
+
     return await call_next(request)
 
-# Optional CORS for manual tests in a browser (Postman/Insomnia don't need this)
+# CORS middleware for OAuth and MCP endpoints
 app.add_middleware(
     CORSMiddleware,
     allow_origins=[o.strip() for o in ALLOWED_ORIGINS if o.strip()],
-    allow_methods=["POST", "OPTIONS"],
+    allow_methods=["GET", "POST", "OPTIONS"],
     allow_headers=["*"],
+    allow_credentials=True,
 )
+
+# OAuth Discovery Endpoint
+@app.get("/.well-known/oauth-authorization-server")
+async def oauth_discovery():
+    return {
+        "issuer": SERVER_BASE_URL,
+        "authorization_endpoint": f"{SERVER_BASE_URL}/oauth/authorize",
+        "token_endpoint": f"{SERVER_BASE_URL}/oauth/token",
+        "response_types_supported": ["code"],
+        "grant_types_supported": ["authorization_code", "refresh_token"],
+        "code_challenge_methods_supported": ["S256"],
+        "scopes_supported": ["read", "write"],
+        "token_endpoint_auth_methods_supported": ["none"]
+    }
+
+# OAuth Authorization Endpoint
+@app.get("/oauth/authorize")
+async def authorize(
+    client_id: str = Query(...),
+    redirect_uri: str = Query(...),
+    response_type: str = Query(...),
+    code_challenge: str = Query(...),
+    code_challenge_method: str = Query(...),
+    scope: str = Query(default="read"),
+    state: str = Query(default="")
+):
+    # Validate parameters
+    if response_type != "code":
+        raise HTTPException(400, "Only 'code' response_type supported")
+    if code_challenge_method != "S256":
+        raise HTTPException(400, "Only S256 code_challenge_method supported")
+
+    # Generate authorization code and store PKCE challenge
+    auth_code = secrets.token_urlsafe(32)
+    oauth_state = secrets.token_urlsafe(16)
+
+    # Store auth code with PKCE challenge
+    auth_codes[auth_code] = {
+        "client_id": client_id,
+        "redirect_uri": redirect_uri,
+        "code_challenge": code_challenge,
+        "scope": scope,
+        "expires_at": datetime.utcnow() + timedelta(minutes=10),
+        "used": False
+    }
+
+    # In a real implementation, you'd redirect to Databricks OAuth
+    # For now, we'll simulate successful auth and redirect with code
+    redirect_url = f"{redirect_uri}?code={auth_code}&state={state}"
+
+    # Return HTML page that auto-redirects (better UX than direct redirect)
+    html_content = f"""
+    <!DOCTYPE html>
+    <html>
+    <head>
+        <title>Databricks Authorization</title>
+    </head>
+    <body>
+        <h2>Authorization Successful</h2>
+        <p>Redirecting to ChatGPT...</p>
+        <script>
+            window.location.href = "{redirect_url}";
+        </script>
+    </body>
+    </html>
+    """
+    return HTMLResponse(content=html_content)
+
+# OAuth Token Exchange Endpoint
+@app.post("/oauth/token")
+async def token_exchange(
+    grant_type: str = Form(...),
+    code: str = Form(...),
+    code_verifier: str = Form(...),
+    client_id: str = Form(...),
+    redirect_uri: str = Form(...)
+):
+    # Validate grant type
+    if grant_type != "authorization_code":
+        raise HTTPException(400, "Only 'authorization_code' grant_type supported")
+
+    # Validate authorization code
+    if code not in auth_codes:
+        raise HTTPException(400, "Invalid authorization code")
+
+    auth_data = auth_codes[code]
+
+    # Check if code is expired or already used
+    if auth_data["used"] or datetime.utcnow() > auth_data["expires_at"]:
+        raise HTTPException(400, "Authorization code expired or already used")
+
+    # Validate PKCE
+    expected_challenge = base64.urlsafe_b64encode(
+        hashlib.sha256(code_verifier.encode()).digest()
+    ).decode().rstrip("=")
+
+    if expected_challenge != auth_data["code_challenge"]:
+        raise HTTPException(400, "Invalid code verifier")
+
+    # Mark code as used
+    auth_data["used"] = True
+
+    # Generate access token
+    access_token = secrets.token_urlsafe(32)
+    refresh_token = secrets.token_urlsafe(32)
+
+    # Store access token
+    access_tokens[access_token] = {
+        "client_id": client_id,
+        "scope": auth_data["scope"],
+        "expires_at": datetime.utcnow() + timedelta(hours=1),
+        "refresh_token": refresh_token
+    }
+
+    return {
+        "access_token": access_token,
+        "token_type": "Bearer",
+        "expires_in": 3600,
+        "refresh_token": refresh_token,
+        "scope": auth_data["scope"]
+    }
 
 # Health check
 @app.get("/healthz", include_in_schema=False)

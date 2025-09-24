@@ -15,3 +15,5 @@ env:
     valueFrom: "mcp-scope:dbx-bridge-token"   # name of your secret
   - name: ALLOWED_ORIGINS
     value: "https://chat.openai.com"
+  - name: SERVER_BASE_URL
+    value: "https://your-databricks-app-url.databricksapps.com"  # Replace with your actual app URL

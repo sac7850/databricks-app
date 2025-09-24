@@ -16,4 +16,4 @@ env:
   - name: ALLOWED_ORIGINS
     value: "https://chat.openai.com"
   - name: SERVER_BASE_URL
-    value: "https://your-databricks-app-url.databricksapps.com"  # Replace with your actual app URL
+    value: "https://databricks-app-2312973499554514.aws.databricksapps.com"  # Replace with your actual app URL
